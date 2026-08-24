@@ -1,5 +1,10 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
+  <ItemGroup>
+    <ProjectReference Include="..\EtherCAT.NET.Engine\EtherCAT.NET.Engine.csproj" />
+    <ProjectReference Include="..\EtherCAT.NET.Transport.Pcap\EtherCAT.NET.Transport.Pcap.csproj" />
+  </ItemGroup>
+
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>

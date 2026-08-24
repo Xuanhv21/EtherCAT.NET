@@ -1,3 +1,6 @@
 <Solution>
   <Project Path="EtherCAT.NET/EtherCAT.NET.csproj" />
+  <Project Path="EtherCAT.NET.Engine/EtherCAT.NET.Engine.csproj" />
+  <Project Path="EtherCAT.NET.Transport.Pcap/EtherCAT.NET.Transport.Pcap.csproj" />
+  <Project Path="EtherCAT.NET.Engine.Tests/EtherCAT.NET.Engine.Tests.csproj" />
 </Solution>
