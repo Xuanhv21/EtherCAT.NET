@@ -6,8 +6,36 @@ using EtherCAT.NET.Engine.ProcessData;
 using EtherCAT.NET.Engine.Protocol;
 using EtherCAT.NET.Engine.StateMachine;
 using EtherCAT.NET.Engine.Tests.Fakes;
+using EtherCAT.NET.Engine.Transport;
 
 namespace EtherCAT.NET.Engine.Tests.ProcessData;
+
+/// <summary>
+/// Transparent <see cref="IEthernetFrameTransport"/> decorator that records the length of every
+/// frame handed to <see cref="Send"/>, so a test can assert on the exact wire size
+/// <see cref="CyclicExchangeService"/> actually produces without needing to intercept or duplicate
+/// its internal datagram-building logic.
+/// </summary>
+file sealed class FrameLengthRecordingTransport(IEthernetFrameTransport inner) : IEthernetFrameTransport
+{
+    public List<int> SentFrameLengths { get; } = [];
+
+    public string Name => inner.Name;
+
+    public event EventHandler<ReadOnlyMemory<byte>>? FrameReceived
+    {
+        add => inner.FrameReceived += value;
+        remove => inner.FrameReceived -= value;
+    }
+
+    public void Send(ReadOnlyMemory<byte> frame)
+    {
+        SentFrameLengths.Add(frame.Length);
+        inner.Send(frame);
+    }
+
+    public void Dispose() => inner.Dispose();
+}
 
 /// <summary>
 /// <see cref="CyclicExchangeService"/> exercised against <see cref="FakeBus"/>/<see cref="FakeSlaveDevice"/>
@@ -122,7 +150,10 @@ public class CyclicExchangeServiceTests
 
         const int cyclesToObserve = 50;
         var samples = new List<(int WrittenTarget, int PriorActual)>();
-        var previousActual = 0; // What TargetPosition must mirror before any Statusword/PositionActualValue has ever been read.
+        // previousCycleActual tracks the PositionActualValue that this service's *previous* cycle
+        // actually read (and therefore must appear as *this* cycle's outbound TargetPosition) --
+        // distinct from "the value we're about to inject for a future cycle to read".
+        var previousCycleActual = 0;
         var nextActualToReport = 1000;
         var done = new ManualResetEventSlim(initialState: false);
 
@@ -140,11 +171,16 @@ public class CyclicExchangeServiceTests
                 }
 
                 var writtenTarget = ReadInt32(fx.Slave, fx.TargetPositionPhysicalAddress);
-                samples.Add((writtenTarget, previousActual));
+
+                // What this very cycle's LRW read actually returned -- the physical register still
+                // holds it, since we only overwrite it below, after recording it.
+                var actualJustRead = ReadInt32(fx.Slave, fx.PositionActualValuePhysicalAddress);
+
+                samples.Add((writtenTarget, previousCycleActual));
+                previousCycleActual = actualJustRead;
 
                 // Make the fake slave report a new, different PositionActualValue for the *next*
                 // cycle to pick up and mirror on the cycle after that.
-                previousActual = nextActualToReport;
                 WriteInt32(fx.Slave, fx.PositionActualValuePhysicalAddress, nextActualToReport);
                 nextActualToReport += 37;
 
@@ -470,5 +506,73 @@ public class CyclicExchangeServiceTests
         Assert.Equal(AlState.Op, observed);
         Assert.Equal(AlState.Op, fx.Service.AlState);
         Assert.Contains(logs, l => l.Contains("AL state changed") && l.Contains("Op"));
+    }
+
+    /// <summary>
+    /// Closes the gap left by <see cref="Protocol.EtherCatFrameRoundTripTests"/>'s 60-byte padding
+    /// test, which builds its 9+23-byte LRW datagram from a hand-typed 32-byte array: here the
+    /// process-image plan (and therefore the RxPdo/TxPdo byte lengths) comes from
+    /// <see cref="ProcessImageBuilder.BuildDefault"/> walking the real, embedded Panasonic ESI
+    /// device, and every single frame <see cref="CyclicExchangeService"/> actually hands to
+    /// <see cref="IEthernetFrameTransport.Send"/> during real cyclic operation is captured and
+    /// measured — proving the Protocol layer's padding-to-60-bytes arithmetic is exact for the
+    /// datagram size this Milestone 1 plan genuinely produces, not merely for a size a test author
+    /// separately typed in by hand.
+    /// </summary>
+    [Fact]
+    public void Every_frame_the_cyclic_loop_actually_sends_is_exactly_60_bytes_for_the_real_ESI_derived_plan()
+    {
+        var bus = new FakeBus();
+        var slave = new FakeSlaveDevice(PanasonicVendorId, Madln01BeProductCode, Madln01BeRevision);
+        bus.AddSlave(slave);
+
+        var rawTransport = new FakeEthernetFrameTransport(bus);
+        var escClient = new EscClient(rawTransport, TestSourceMac);
+
+        var discovery = SlaveDiscovery.DiscoverSingleSlave(escClient, EsiXmlParser.ParseEmbeddedPanasonicMinasA6Be());
+        var plan = ProcessImageBuilder.BuildDefault(discovery.Device);
+
+        // Sanity: this is genuinely the plan's own arithmetic (9 + 23 = 32 data bytes), not a
+        // number restated from the implementation plan's prose.
+        Assert.Equal(9, plan.RxPdoLayout.TotalByteLength);
+        Assert.Equal(23, plan.TxPdoLayout.TotalByteLength);
+
+        var stateMachine = new AlStateMachine(escClient, rawTransport, TestSourceMac, discovery.StationAddress)
+        {
+            PollInterval = TimeSpan.Zero,
+        };
+        stateMachine.TransitionToPreOp(discovery.Device);
+        stateMachine.TransitionToSafeOp(discovery.Device, plan);
+
+        var recordingTransport = new FrameLengthRecordingTransport(rawTransport);
+        var service = new CyclicExchangeService(recordingTransport, TestSourceMac, plan)
+        {
+            Period = TimeSpan.FromMilliseconds(1),
+            ReplyTimeout = TimeSpan.FromMilliseconds(200),
+        };
+
+        var done = new ManualResetEventSlim(initialState: false);
+        var cycles = 0;
+        service.StatusUpdated += _ =>
+        {
+            if (Interlocked.Increment(ref cycles) >= 20)
+            {
+                done.Set();
+            }
+        };
+
+        service.Start();
+        try
+        {
+            Assert.True(done.Wait(TimeSpan.FromSeconds(10)), "Did not observe enough cycles in time.");
+        }
+        finally
+        {
+            service.Stop(TimeSpan.FromSeconds(2));
+        }
+
+        // 20+ regular cycles plus Stop()'s own final safe-shutdown exchange.
+        Assert.True(recordingTransport.SentFrameLengths.Count >= 21);
+        Assert.All(recordingTransport.SentFrameLengths, length => Assert.Equal(60, length));
     }
 }
