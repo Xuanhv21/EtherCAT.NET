@@ -5,6 +5,7 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:EtherCAT.NET"
         mc:Ignorable="d"
+        d:DataContext="{d:DesignInstance Type={x:Type local:MainWindowViewModel}}"
         Title="EtherCAT.NET -- Milestone 1 Bring-Up" Height="620" Width="920"
         MinHeight="480" MinWidth="720">
     <Window.Resources>
