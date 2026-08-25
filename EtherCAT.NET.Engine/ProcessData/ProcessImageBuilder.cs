@@ -73,6 +73,92 @@ public static class ProcessImageBuilder
     }
 
     /// <summary>
+    /// Builds the combined process-image plan for a whole GROUP of slaves sharing one cyclic LRW
+    /// exchange, using each slave's fixed/default Milestone 1 mappings (RxPDO
+    /// <see cref="DefaultRxPdoIndex"/>, TxPDO <see cref="DefaultTxPdoIndex"/>), laid out
+    /// outputs-then-inputs across the shared logical address space per
+    /// <see cref="MultiSlaveProcessImagePlan"/>'s own layout convention (the single-slave
+    /// <see cref="Build"/>'s FMMU0/FMMU1 convention, just repeated per slave).
+    /// </summary>
+    /// <param name="slaves">Every slave to include, in the order their outputs/inputs should be laid out (typically discovery order).</param>
+    /// <exception cref="ArgumentException"><paramref name="slaves"/> is empty.</exception>
+    /// <exception cref="InvalidOperationException">Some slave's device does not declare exactly one RxPdo/TxPdo with the expected index, or a PDO does not declare a valid SyncManager.</exception>
+    public static MultiSlaveProcessImagePlan BuildMulti(IReadOnlyList<(ushort StationAddress, EsiDeviceDescriptor Device)> slaves)
+    {
+        ArgumentNullException.ThrowIfNull(slaves);
+        if (slaves.Count == 0)
+        {
+            throw new ArgumentException("At least one slave is required.", nameof(slaves));
+        }
+
+        var rxPdos = new EsiPdo[slaves.Count];
+        var txPdos = new EsiPdo[slaves.Count];
+        var rxLayouts = new PdoLayout[slaves.Count];
+        var txLayouts = new PdoLayout[slaves.Count];
+
+        for (var i = 0; i < slaves.Count; i++)
+        {
+            rxPdos[i] = FindPdo(slaves[i].Device.RxPdos, DefaultRxPdoIndex, "RxPdo");
+            txPdos[i] = FindPdo(slaves[i].Device.TxPdos, DefaultTxPdoIndex, "TxPdo");
+            rxLayouts[i] = BuildLayout(rxPdos[i]);
+            txLayouts[i] = BuildLayout(txPdos[i]);
+        }
+
+        var outputsOffsets = new int[slaves.Count];
+        var outputsRunning = 0;
+        for (var i = 0; i < slaves.Count; i++)
+        {
+            outputsOffsets[i] = outputsRunning;
+            outputsRunning += rxLayouts[i].TotalByteLength;
+        }
+
+        var totalOutputs = outputsRunning;
+
+        var inputsOffsets = new int[slaves.Count];
+        var inputsRunning = 0;
+        for (var i = 0; i < slaves.Count; i++)
+        {
+            inputsOffsets[i] = inputsRunning;
+            inputsRunning += txLayouts[i].TotalByteLength;
+        }
+
+        var totalInputs = inputsRunning;
+
+        var slaveImages = new List<SlaveProcessImage>(slaves.Count);
+        for (var i = 0; i < slaves.Count; i++)
+        {
+            var outputsSyncManager = ResolveSyncManager(slaves[i].Device, rxPdos[i]);
+            var inputsSyncManager = ResolveSyncManager(slaves[i].Device, txPdos[i]);
+
+            var outputsFmmu = FmmuConfig.ForByteAlignedRegion(
+                logicalStartAddress: (uint)outputsOffsets[i],
+                length: (ushort)rxLayouts[i].TotalByteLength,
+                physicalStartAddress: outputsSyncManager.StartAddress,
+                readEnabled: false,
+                writeEnabled: true);
+
+            var inputsFmmu = FmmuConfig.ForByteAlignedRegion(
+                logicalStartAddress: (uint)(totalOutputs + inputsOffsets[i]),
+                length: (ushort)txLayouts[i].TotalByteLength,
+                physicalStartAddress: inputsSyncManager.StartAddress,
+                readEnabled: true,
+                writeEnabled: false);
+
+            slaveImages.Add(new SlaveProcessImage(
+                slaves[i].StationAddress,
+                slaves[i].Device,
+                rxLayouts[i],
+                txLayouts[i],
+                outputsFmmu,
+                inputsFmmu,
+                outputsOffsets[i],
+                inputsOffsets[i]));
+        }
+
+        return new MultiSlaveProcessImagePlan(slaveImages, totalOutputs, totalInputs);
+    }
+
+    /// <summary>
     /// Computes the byte layout of a single PDO mapping: walks <paramref name="pdo"/>'s entries in
     /// declared order, assigning each one the running byte-offset total and accumulating
     /// <c>BitLength / 8</c> for the next entry.

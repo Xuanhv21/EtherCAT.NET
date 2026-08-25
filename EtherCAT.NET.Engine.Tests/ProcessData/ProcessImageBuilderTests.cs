@@ -104,4 +104,78 @@ public class ProcessImageBuilderTests
         Assert.Equal(name, entry.Name);
         Assert.Equal(byteOffset, entry.ByteOffset);
     }
+
+    // --- BuildMulti: combined outputs-then-inputs layout across a GROUP of slaves. ---
+
+    [Fact]
+    public void BuildMulti_throws_for_an_empty_slave_list()
+    {
+        Assert.Throws<ArgumentException>(() => ProcessImageBuilder.BuildMulti([]));
+    }
+
+    [Fact]
+    public void BuildMulti_lays_out_two_slaves_outputs_then_inputs_with_correct_offsets_and_expected_wkc()
+    {
+        var device = GetMadln01Be();
+        const ushort station0 = 0x1001;
+        const ushort station1 = 0x1002;
+
+        var plan = ProcessImageBuilder.BuildMulti([(station0, device), (station1, device)]);
+
+        // 9-byte outputs + 23-byte inputs per slave (the same single-slave lengths asserted above),
+        // concatenated: slave0 outputs [0,9), slave1 outputs [9,18); total outputs = 18.
+        Assert.Equal(18, plan.TotalOutputsLength);
+        Assert.Equal(46, plan.TotalInputsLength); // 23 + 23
+        Assert.Equal(64, plan.TotalLength);
+        Assert.Equal((ushort)4, plan.ExpectedWorkingCounter); // 2 per slave x 2 slaves.
+
+        Assert.Equal(2, plan.Slaves.Count);
+
+        var slave0 = plan.Slaves[0];
+        Assert.Equal(station0, slave0.StationAddress);
+        Assert.Equal(0, slave0.OutputsOffset);
+        Assert.Equal(0, slave0.InputsOffset);
+        Assert.Equal(0u, slave0.OutputsFmmu.LogicalStartAddress);
+        Assert.Equal(9, slave0.OutputsFmmu.Length);
+        Assert.Equal(0x1400, slave0.OutputsFmmu.PhysicalStartAddress);
+        Assert.True(slave0.OutputsFmmu.WriteEnabled);
+        Assert.False(slave0.OutputsFmmu.ReadEnabled);
+        // Slave 0's inputs sit right at the start of the combined inputs region (offset 18 overall).
+        Assert.Equal((uint)plan.TotalOutputsLength, slave0.InputsFmmu.LogicalStartAddress);
+        Assert.Equal(23, slave0.InputsFmmu.Length);
+        Assert.Equal(0x1600, slave0.InputsFmmu.PhysicalStartAddress);
+        Assert.True(slave0.InputsFmmu.ReadEnabled);
+        Assert.False(slave0.InputsFmmu.WriteEnabled);
+
+        var slave1 = plan.Slaves[1];
+        Assert.Equal(station1, slave1.StationAddress);
+        Assert.Equal(9, slave1.OutputsOffset); // right after slave0's 9 bytes.
+        Assert.Equal(23, slave1.InputsOffset); // right after slave0's 23 bytes, within the inputs region.
+        Assert.Equal(9u, slave1.OutputsFmmu.LogicalStartAddress);
+        Assert.Equal(9, slave1.OutputsFmmu.Length);
+        // Slave 1's inputs sit right after slave 0's inputs within the combined inputs region: 18 + 23 = 41.
+        Assert.Equal((uint)(plan.TotalOutputsLength + 23), slave1.InputsFmmu.LogicalStartAddress);
+        Assert.Equal(23, slave1.InputsFmmu.Length);
+
+        // Physical addresses are per-slave-local (each slave's own SM2/SM3), so both slaves' FMMUs
+        // point at the same physical addresses even though their logical ranges never overlap.
+        Assert.Equal(slave0.OutputsFmmu.PhysicalStartAddress, slave1.OutputsFmmu.PhysicalStartAddress);
+        Assert.Equal(slave0.InputsFmmu.PhysicalStartAddress, slave1.InputsFmmu.PhysicalStartAddress);
+    }
+
+    [Fact]
+    public void BuildMulti_with_one_slave_matches_BuildDefault_single_slave_layout()
+    {
+        var device = GetMadln01Be();
+
+        var multi = ProcessImageBuilder.BuildMulti([((ushort)0x1001, device)]);
+        var single = ProcessImageBuilder.BuildDefault(device);
+
+        Assert.Single(multi.Slaves);
+        Assert.Equal(single.RxPdoLayout.TotalByteLength, multi.TotalOutputsLength);
+        Assert.Equal(single.TxPdoLayout.TotalByteLength, multi.TotalInputsLength);
+        Assert.Equal((ushort)2, multi.ExpectedWorkingCounter);
+        Assert.Equal(single.OutputsFmmu, multi.Slaves[0].OutputsFmmu);
+        Assert.Equal(single.InputsFmmu, multi.Slaves[0].InputsFmmu);
+    }
 }

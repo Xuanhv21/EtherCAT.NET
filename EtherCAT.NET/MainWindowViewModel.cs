@@ -17,21 +17,25 @@ namespace EtherCAT.NET;
 
 /// <summary>
 /// The Milestone 1 bring-up view model described in the implementation plan's "UI WPF" section.
-/// Owns the whole master pipeline for one adapter/one slave: opens
+/// Owns the whole master pipeline for one adapter/one GROUP of slaves: opens
 /// <see cref="PcapEthernetFrameTransport"/> for the selected <see cref="AdapterInfo"/>, runs
-/// <see cref="SlaveDiscovery"/> against every ESI file currently loaded from <see cref="EsiFolderPath"/>
-/// (any vendor's files side by side -- see <see cref="EsiCatalog"/> and <see cref="RescanEsiFolder"/>),
-/// computes the process-image plan with <see cref="ProcessImageBuilder"/>, drives
-/// <see cref="AlStateMachine"/> INIT-&gt;PREOP-&gt;SAFEOP-&gt;OP (wiring its <c>onSafeOpRequested</c>
-/// hook to start <see cref="CyclicExchangeService"/> at exactly the right instant, per
-/// <see cref="AlStateMachine"/>'s own remarks), and thereafter exposes the cyclic exchange's
-/// Statusword bits, AL state, and log as bindable properties.
+/// <see cref="SlaveDiscovery.DiscoverAllSlaves"/> against every ESI file currently loaded from
+/// <see cref="EsiFolderPath"/> (any vendor's files side by side -- see <see cref="EsiCatalog"/> and
+/// <see cref="RescanEsiFolder"/>), computes the combined process-image plan with
+/// <see cref="ProcessImageBuilder.BuildMulti"/>, drives <see cref="MultiSlaveAlStateMachine"/>
+/// INIT-&gt;PREOP-&gt;SAFEOP-&gt;OP for the whole group at once (wiring its <c>onSafeOpRequested</c>
+/// hook to start <see cref="MultiSlaveCyclicExchangeService"/> at exactly the right instant, per
+/// <see cref="MultiSlaveAlStateMachine"/>'s own remarks), and thereafter exposes the currently
+/// <see cref="SelectedSlave"/>'s Statusword bits, the group's AL state, and the shared log as
+/// bindable properties. <see cref="Slaves"/> lists every slave discovered, and the five DS402
+/// Controlword buttons always target whichever one is currently selected -- never the whole group at
+/// once.
 /// </summary>
 /// <remarks>
 /// <para>
 /// <b>Threading:</b> this type is constructed on the UI thread, where it captures
 /// <see cref="SynchronizationContext.Current"/>. Every property this class mutates from
-/// <see cref="CyclicExchangeService.StatusUpdated"/>/<see cref="CyclicExchangeService.LogEmitted"/>
+/// <see cref="MultiSlaveCyclicExchangeService.StatusUpdated"/>/<see cref="MultiSlaveCyclicExchangeService.LogEmitted"/>
 /// (which fire on the cyclic background thread) or from the Start/Stop bring-up/tear-down work
 /// (which runs on a <see cref="Task.Run(Action)"/> thread pool thread so it never blocks the UI) is
 /// only ever written back on the UI thread, via <see cref="SynchronizationContext.Post"/> — never
@@ -68,10 +72,11 @@ public sealed class MainWindowViewModel : ObservableObject
     private int _lifecycleState = LifecycleIdle;
 
     private PcapEthernetFrameTransport? _transport;
-    private CyclicExchangeService? _cyclicExchange;
+    private MultiSlaveCyclicExchangeService? _cyclicExchange;
     private EsiCatalog _esiCatalog = new([]);
 
     private AdapterInfo? _selectedAdapter;
+    private SlaveListItem? _selectedSlave;
     private string? _adapterError;
     private bool _isBusy;
     private bool _isRunning;
@@ -96,6 +101,7 @@ public sealed class MainWindowViewModel : ObservableObject
         _uiContext = SynchronizationContext.Current;
 
         Adapters = [];
+        Slaves = [];
         LogEntries = [];
 
         StartCommand = new RelayCommand(() => _ = StartAsync(), () => CanStart);
@@ -104,11 +110,11 @@ public sealed class MainWindowViewModel : ObservableObject
         BrowseEsiFolderCommand = new RelayCommand(BrowseEsiFolder, () => !IsBusy && !IsRunning);
         RescanEsiFolderCommand = new RelayCommand(RescanEsiFolder, () => !IsBusy && !IsRunning);
 
-        ShutdownCommand = new RelayCommand(() => SendControlword("Shutdown", Ds402Controlword.Shutdown), () => IsRunning);
-        SwitchOnCommand = new RelayCommand(() => SendControlword("Switch On", Ds402Controlword.SwitchOn), () => IsRunning);
-        EnableOperationCommand = new RelayCommand(() => SendControlword("Enable Operation", Ds402Controlword.EnableOperation), () => IsRunning);
-        DisableVoltageCommand = new RelayCommand(() => SendControlword("Disable Voltage", Ds402Controlword.DisableVoltage), () => IsRunning);
-        FaultResetCommand = new RelayCommand(() => SendControlword("Fault Reset", Ds402Controlword.FaultReset), () => IsRunning);
+        ShutdownCommand = new RelayCommand(() => SendControlword("Shutdown", Ds402Controlword.Shutdown), () => CanSendControlword);
+        SwitchOnCommand = new RelayCommand(() => SendControlword("Switch On", Ds402Controlword.SwitchOn), () => CanSendControlword);
+        EnableOperationCommand = new RelayCommand(() => SendControlword("Enable Operation", Ds402Controlword.EnableOperation), () => CanSendControlword);
+        DisableVoltageCommand = new RelayCommand(() => SendControlword("Disable Voltage", Ds402Controlword.DisableVoltage), () => CanSendControlword);
+        FaultResetCommand = new RelayCommand(() => SendControlword("Fault Reset", Ds402Controlword.FaultReset), () => CanSendControlword);
 
         LoadAdapters();
 
@@ -120,6 +126,13 @@ public sealed class MainWindowViewModel : ObservableObject
 
     /// <summary>Every adapter <see cref="PcapAdapters.GetAvailableAdapters()"/> reported the last time it was called — never throws, never null, empty when Npcap is missing.</summary>
     public ObservableCollection<AdapterInfo> Adapters { get; }
+
+    /// <summary>
+    /// Every slave the last successful <see cref="RunBringUp"/> discovered, in discovery order
+    /// (matching the index every multi-slave engine type addresses that slave by). Empty until a
+    /// bring-up has actually completed discovery at least once; cleared on <see cref="StopAsync"/>.
+    /// </summary>
+    public ObservableCollection<SlaveListItem> Slaves { get; }
 
     /// <summary>Scrolling bring-up/status log, newest entries at the end.</summary>
     public ObservableCollection<LogEntry> LogEntries { get; }
@@ -146,6 +159,24 @@ public sealed class MainWindowViewModel : ObservableObject
     {
         get => _adapterError;
         private set => SetField(ref _adapterError, value);
+    }
+
+    /// <summary>
+    /// The slave currently selected in the picker: the Statusword panel and the five DS402
+    /// Controlword buttons always act on exactly this one slave, never the whole group at once.
+    /// Settable at any time (selecting does not touch the running engine, only which slave's live
+    /// data is displayed/controlled) but only meaningful once <see cref="Slaves"/> is non-empty.
+    /// </summary>
+    public SlaveListItem? SelectedSlave
+    {
+        get => _selectedSlave;
+        set
+        {
+            if (SetField(ref _selectedSlave, value))
+            {
+                RaiseCanExecuteChangedAll();
+            }
+        }
     }
 
     /// <summary><c>true</c> while a Start or Stop bring-up/tear-down is actually in flight on the background thread.</summary>
@@ -268,6 +299,9 @@ public sealed class MainWindowViewModel : ObservableObject
     private bool CanStart => !IsBusy && !IsRunning && SelectedAdapter is not null && _esiCatalog.Libraries.Count > 0;
 
     private bool CanStop => !IsBusy && IsRunning;
+
+    /// <summary>The five DS402 Controlword buttons all share this gate: the group must be running, AND a slave must actually be selected to receive the command.</summary>
+    private bool CanSendControlword => IsRunning && SelectedSlave is not null;
 
     /// <summary>
     /// Enumerates available capture adapters via <see cref="PcapAdapters.GetAvailableAdapters(out string?)"/>,
@@ -494,21 +528,29 @@ public sealed class MainWindowViewModel : ObservableObject
             AlStateText = "Stopped";
             IsRunning = false;
             IsBusy = false;
+            RunOnUiThread(() =>
+            {
+                Slaves.Clear();
+                SelectedSlave = null;
+            });
             Interlocked.Exchange(ref _lifecycleState, LifecycleIdle);
         }
     }
 
     /// <summary>
-    /// Runs on a thread pool thread (never the UI thread): opens the transport, discovers the
-    /// slave, builds the process-image plan, and drives <see cref="AlStateMachine"/> all the way to
-    /// OP, wiring its <c>onSafeOpRequested</c> hook to start <see cref="CyclicExchangeService"/> at
-    /// exactly the point the plan's remarks describe. On any failure, disposes whatever was opened
-    /// and rethrows so <see cref="StartAsync"/> can report it.
+    /// Runs on a thread pool thread (never the UI thread): opens the transport, discovers every
+    /// slave on the bus, builds the combined process-image plan, and drives
+    /// <see cref="MultiSlaveAlStateMachine"/> all the way to OP for the whole group at once, wiring
+    /// its <c>onSafeOpRequested</c> hook to start <see cref="MultiSlaveCyclicExchangeService"/> at
+    /// exactly the point its remarks describe. Populates <see cref="Slaves"/> (and selects the first
+    /// one) as soon as discovery succeeds, before the state machine work even starts, so the picker
+    /// is usable the moment it can be. On any failure, disposes whatever was opened and rethrows so
+    /// <see cref="StartAsync"/> can report it.
     /// </summary>
     private void RunBringUp(AdapterInfo adapter)
     {
         var transport = new PcapEthernetFrameTransport(adapter);
-        CyclicExchangeService? cyclic = null;
+        MultiSlaveCyclicExchangeService? cyclic = null;
 
         try
         {
@@ -523,25 +565,51 @@ public sealed class MainWindowViewModel : ObservableObject
             }
 
             AppendLog("Discovering slave(s) on the bus...");
-            var discovery = SlaveDiscovery.DiscoverSingleSlave(escClient, catalog.Libraries);
-            AppendLog($"Discovered {discovery.SlaveCount} slave(s); matched '{discovery.Device.Name}' " +
-                      $"(ProductCode=0x{discovery.Device.ProductCode:X8}, Revision=0x{discovery.Device.RevisionNumber:X8}), " +
-                      $"assigned Configured Station Address 0x{discovery.StationAddress:X4}.");
+            var discoveries = SlaveDiscovery.DiscoverAllSlaves(escClient, catalog.Libraries);
 
-            var plan = ProcessImageBuilder.BuildDefault(discovery.Device);
+            if (discoveries.Count == 0)
+            {
+                throw new InvalidOperationException("No slaves responded on the bus.");
+            }
 
-            var stateMachine = new AlStateMachine(escClient, transport, SourceMac, discovery.StationAddress);
-            cyclic = new CyclicExchangeService(transport, SourceMac, plan);
+            var slaveItems = new List<SlaveListItem>(discoveries.Count);
+            for (var i = 0; i < discoveries.Count; i++)
+            {
+                var d = discoveries[i];
+                AppendLog($"  Slave {i}: matched '{d.Device.Name}' (ProductCode=0x{d.Device.ProductCode:X8}, " +
+                          $"Revision=0x{d.Device.RevisionNumber:X8}), assigned Configured Station Address 0x{d.StationAddress:X4}.");
+                slaveItems.Add(new SlaveListItem(i, d.StationAddress, d.Device.Name));
+            }
+
+            AppendLog($"Discovered {discoveries.Count} slave(s) total.");
+
+            RunOnUiThread(() =>
+            {
+                Slaves.Clear();
+                foreach (var item in slaveItems)
+                {
+                    Slaves.Add(item);
+                }
+
+                SelectedSlave = Slaves.Count > 0 ? Slaves[0] : null;
+            });
+
+            var devices = discoveries.Select(d => d.Device).ToList();
+            var stationAddresses = discoveries.Select(d => d.StationAddress).ToList();
+            var plan = ProcessImageBuilder.BuildMulti(discoveries.Select(d => (d.StationAddress, d.Device)).ToList());
+
+            var stateMachine = new MultiSlaveAlStateMachine(escClient, transport, SourceMac, stationAddresses);
+            cyclic = new MultiSlaveCyclicExchangeService(transport, SourceMac, plan);
             cyclic.StatusUpdated += OnStatusUpdated;
             cyclic.LogEmitted += AppendLog;
 
-            AppendLog("Requesting PREOP...");
-            stateMachine.TransitionToPreOp(discovery.Device);
+            AppendLog("Requesting PREOP for all slaves...");
+            stateMachine.TransitionToPreOp(devices);
             cyclic.SetAlState(AlState.PreOp);
             AppendLog("Reached PREOP.");
 
-            AppendLog("Requesting SAFEOP and starting cyclic exchange...");
-            stateMachine.TransitionToSafeOp(discovery.Device, plan, onSafeOpRequested: cyclic.Start);
+            AppendLog("Requesting SAFEOP for all slaves and starting cyclic exchange...");
+            stateMachine.TransitionToSafeOp(devices, plan, onSafeOpRequested: cyclic.Start);
             cyclic.SetAlState(AlState.SafeOp);
             AppendLog("Reached SAFEOP.");
 
@@ -556,11 +624,11 @@ public sealed class MainWindowViewModel : ObservableObject
         catch
         {
             // cyclic.Start() may already have been called (inside TransitionToSafeOp's
-            // onSafeOpRequested hook, per AlStateMachine's own remarks) even though a *later* step
-            // (e.g. TransitionToOp's readiness wait) is what actually failed -- so an already-live
-            // cyclic thread must be stopped cleanly (its own final Disable Voltage exchange still
-            // going out over the still-open transport) before the transport is disposed, rather
-            // than left running to fail on its own against a disposed transport.
+            // onSafeOpRequested hook, per MultiSlaveAlStateMachine's own remarks) even though a
+            // *later* step (e.g. TransitionToOp's readiness wait) is what actually failed -- so an
+            // already-live cyclic thread must be stopped cleanly (its own final safe-shutdown
+            // exchange still going out over the still-open transport) before the transport is
+            // disposed, rather than left running to fail on its own against a disposed transport.
             if (cyclic is not null)
             {
                 cyclic.StatusUpdated -= OnStatusUpdated;
@@ -583,31 +651,48 @@ public sealed class MainWindowViewModel : ObservableObject
     }
 
     /// <summary>
-    /// <see cref="CyclicExchangeService.StatusUpdated"/> handler — runs on the cyclic background
-    /// thread. Marshals every bound-property write onto the UI thread via <see cref="RunOnUiThread"/>.
+    /// <see cref="MultiSlaveCyclicExchangeService.StatusUpdated"/> handler — runs on the cyclic
+    /// background thread. Publishes the group-level AL state/data-freshness immediately, and the
+    /// currently <see cref="SelectedSlave"/>'s Statusword bits specifically (every other slave's data
+    /// is still in <paramref name="snapshot"/>, it is simply not the one bound to the UI right now).
+    /// Marshals every bound-property write onto the UI thread via <see cref="RunOnUiThread"/>.
     /// </summary>
-    private void OnStatusUpdated(ProcessImageSnapshot snapshot)
+    private void OnStatusUpdated(MultiSlaveProcessImageSnapshot snapshot)
     {
         RunOnUiThread(() =>
         {
             AlStateText = snapshot.IsFaulted ? $"{snapshot.AlState} (FAULTED)" : snapshot.AlState.ToString();
-
-            ReadyToSwitchOn = snapshot.Status.ReadyToSwitchOn;
-            SwitchedOn = snapshot.Status.SwitchedOn;
-            OperationEnabled = snapshot.Status.OperationEnabled;
-            Fault = snapshot.Status.Fault;
-            VoltageEnabled = snapshot.Status.VoltageEnabled;
-            QuickStop = snapshot.Status.QuickStop;
-            SwitchOnDisabled = snapshot.Status.SwitchOnDisabled;
-            Warning = snapshot.Status.Warning;
             IsDataFresh = snapshot.IsDataFresh;
+
+            var index = SelectedSlave?.Index ?? -1;
+            if (index < 0 || index >= snapshot.Slaves.Count)
+            {
+                return;
+            }
+
+            var status = snapshot.Slaves[index].Status;
+            ReadyToSwitchOn = status.ReadyToSwitchOn;
+            SwitchedOn = status.SwitchedOn;
+            OperationEnabled = status.OperationEnabled;
+            Fault = status.Fault;
+            VoltageEnabled = status.VoltageEnabled;
+            QuickStop = status.QuickStop;
+            SwitchOnDisabled = status.SwitchOnDisabled;
+            Warning = status.Warning;
         });
     }
 
+    /// <summary>Sends Controlword <paramref name="value"/> to whichever slave is currently <see cref="SelectedSlave"/> -- never the whole group. A no-op (aside from logging) if none is selected; <see cref="CanSendControlword"/> already gates the five buttons on that.</summary>
     private void SendControlword(string name, ushort value)
     {
-        _cyclicExchange?.SetControlword(value);
-        AppendLog($"Controlword -> {name} (0x{value:X4}).");
+        var slave = SelectedSlave;
+        if (slave is null)
+        {
+            return;
+        }
+
+        _cyclicExchange?.SetControlword(slave.Index, value);
+        AppendLog($"Slave {slave.Index} (station 0x{slave.StationAddress:X4}): Controlword -> {name} (0x{value:X4}).");
     }
 
     /// <summary>

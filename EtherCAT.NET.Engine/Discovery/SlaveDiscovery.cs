@@ -96,6 +96,51 @@ public static class SlaveDiscovery
 
         return new DiscoveryResult(slaveCount, stationAddress, identity, device);
     }
+
+    /// <summary>
+    /// Runs the full multi-slave discovery sequence for every slave the initial BRD reports: for each
+    /// auto-increment ring position 0..N-1 in order, assigns it Configured Station Address
+    /// <see cref="FirstStationAddress"/> + position via APWR (ADP = the two's-complement ring
+    /// position -- 0, -1, -2, ... -- per the standard ETG.1000.4 auto-increment addressing
+    /// convention: each slave decrements ADP by one as the datagram passes through, and the slave
+    /// where it lands on zero is the one that responds), then reads and matches its SII identity
+    /// against <paramref name="esiLibraries"/>, exactly like
+    /// <see cref="DiscoverSingleSlave(EscClient, IEnumerable{EsiDeviceLibrary}, ushort)"/> does for
+    /// its one slave.
+    /// </summary>
+    /// <remarks>
+    /// The ring-position addressing this method walks matches <c>FakeBus</c>'s own model of it and
+    /// the standard convention, but -- like everything in this milestone that has only ever run
+    /// against a single real Panasonic drive -- has not yet been confirmed against real multi-slave
+    /// hardware. Confirm it once a second real slave is available to test with.
+    /// </remarks>
+    /// <exception cref="EscCommunicationException">No reply was observed to the initial BRD.</exception>
+    /// <exception cref="EscWorkingCounterException">A slave expected at some ring position did not answer an APWR, or a later register access failed.</exception>
+    /// <exception cref="SlaveIdentityMismatchException">Some slave's discovered identity matches no device in any of <paramref name="esiLibraries"/>, or more than one.</exception>
+    public static IReadOnlyList<DiscoveryResult> DiscoverAllSlaves(EscClient escClient, IEnumerable<EsiDeviceLibrary> esiLibraries)
+    {
+        ArgumentNullException.ThrowIfNull(escClient);
+        ArgumentNullException.ThrowIfNull(esiLibraries);
+
+        var libraries = esiLibraries as IReadOnlyList<EsiDeviceLibrary> ?? esiLibraries.ToList();
+        var slaveCount = CountSlaves(escClient);
+        var results = new List<DiscoveryResult>(slaveCount);
+
+        for (var position = 0; position < slaveCount; position++)
+        {
+            var stationAddress = (ushort)(FirstStationAddress + position);
+            var autoIncrementAddress = unchecked((ushort)(0 - position));
+
+            AssignStationAddress(escClient, stationAddress, autoIncrementAddress);
+
+            var identity = SlaveIdentity.Read(escClient, stationAddress);
+            var device = IdentityMatcher.MatchAny(identity, libraries);
+
+            results.Add(new DiscoveryResult(slaveCount, stationAddress, identity, device));
+        }
+
+        return results;
+    }
 }
 
 /// <summary>Outcome of <see cref="SlaveDiscovery.DiscoverSingleSlave"/>.</summary>

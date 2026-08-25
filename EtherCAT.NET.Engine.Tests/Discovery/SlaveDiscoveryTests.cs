@@ -158,4 +158,67 @@ public class SlaveDiscoveryTests
         var ex = Assert.Throws<SlaveIdentityMismatchException>(() => SlaveDiscovery.DiscoverSingleSlave(client, CombinedLibraries()));
         Assert.False(string.IsNullOrWhiteSpace(ex.Message));
     }
+
+    // --- DiscoverAllSlaves: walks every auto-increment ring position, not just position 0. ---
+
+    [Fact]
+    public void DiscoverAllSlaves_returns_zero_results_when_no_slave_answers_the_bus()
+    {
+        var bus = new FakeBus(); // no slaves added at all.
+        var client = CreateClient(bus);
+
+        var results = SlaveDiscovery.DiscoverAllSlaves(client, CombinedLibraries());
+
+        Assert.Empty(results);
+    }
+
+    [Fact]
+    public void DiscoverAllSlaves_assigns_increasing_station_addresses_to_every_slave_on_the_bus()
+    {
+        var bus = new FakeBus();
+        bus.AddSlave(new FakeSlaveDevice(PanasonicVendorId, Madln01BeProductCode, Madln01BeRevision)); // ring position 0
+        bus.AddSlave(new FakeSlaveDevice(PanasonicVendorId, Madln01BeProductCode, Madln01BeRevision)); // ring position 1
+        bus.AddSlave(new FakeSlaveDevice(PanasonicVendorId, Madln01BeProductCode, Madln01BeRevision)); // ring position 2
+        var client = CreateClient(bus);
+
+        var results = SlaveDiscovery.DiscoverAllSlaves(client, CombinedLibraries());
+
+        Assert.Equal(3, results.Count);
+        Assert.All(results, r => Assert.Equal(3, r.SlaveCount));
+
+        Assert.Equal((ushort)(SlaveDiscovery.FirstStationAddress + 0), results[0].StationAddress);
+        Assert.Equal((ushort)(SlaveDiscovery.FirstStationAddress + 1), results[1].StationAddress);
+        Assert.Equal((ushort)(SlaveDiscovery.FirstStationAddress + 2), results[2].StationAddress);
+
+        // Every assigned address must actually be independently reachable afterwards -- not just
+        // recorded, but usable for node-addressed FPRD/FPWR against the right physical slave.
+        Assert.All(results, r => Assert.Equal(PanasonicVendorId, r.Identity.VendorId));
+    }
+
+    [Fact]
+    public void DiscoverAllSlaves_matches_each_slave_against_the_combined_catalog_independently_by_position()
+    {
+        var bus = new FakeBus();
+        bus.AddSlave(new FakeSlaveDevice(PanasonicVendorId, Madln01BeProductCode, Madln01BeRevision)); // position 0: Panasonic
+        bus.AddSlave(new FakeSlaveDevice(SyntheticVendorId, SyntheticProductCode, SyntheticRevisionNumber)); // position 1: a different vendor entirely
+        var client = CreateClient(bus);
+
+        var results = SlaveDiscovery.DiscoverAllSlaves(client, CombinedLibraries());
+
+        Assert.Equal(2, results.Count);
+        Assert.Equal("MADLN01BE", results[0].Device.Name);
+        Assert.Equal(EsiCatalogTests.SyntheticDeviceName, results[1].Device.Name);
+    }
+
+    [Fact]
+    public void DiscoverAllSlaves_throws_for_whichever_slave_matches_no_device_without_losing_the_others()
+    {
+        var bus = new FakeBus();
+        bus.AddSlave(new FakeSlaveDevice(PanasonicVendorId, Madln01BeProductCode, Madln01BeRevision)); // position 0: matches fine
+        bus.AddSlave(new FakeSlaveDevice(vendorId: 0x0000AAAA, productCode: 0x0000BBBB, revisionNumber: 0x0000CCCC)); // position 1: matches nothing
+        var client = CreateClient(bus);
+
+        var ex = Assert.Throws<SlaveIdentityMismatchException>(() => SlaveDiscovery.DiscoverAllSlaves(client, CombinedLibraries()));
+        Assert.False(string.IsNullOrWhiteSpace(ex.Message));
+    }
 }

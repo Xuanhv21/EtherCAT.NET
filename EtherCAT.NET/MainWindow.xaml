@@ -14,6 +14,7 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
@@ -59,14 +60,24 @@
             <CheckBox IsChecked="{Binding IsDataFresh, Mode=OneWay}" IsHitTestVisible="False" Focusable="False" VerticalAlignment="Center" />
         </StackPanel>
 
-        <!-- Row 4: Statusword indicators + DS402 Controlword buttons, side by side -->
-        <Grid Grid.Row="4" Margin="0,0,0,10">
+        <!-- Row 4: slave picker, populated once discovery succeeds; the Statusword panel and the
+             five Controlword buttons below always act on whichever one is selected here, never the
+             whole group at once. -->
+        <DockPanel Grid.Row="4" Margin="0,0,0,10" LastChildFill="True">
+            <TextBlock Text="Controlling slave:" VerticalAlignment="Center" Margin="0,0,6,0" DockPanel.Dock="Left" />
+            <ComboBox Width="360" HorizontalAlignment="Left" VerticalAlignment="Center"
+                      ItemsSource="{Binding Slaves}"
+                      SelectedItem="{Binding SelectedSlave}" />
+        </DockPanel>
+
+        <!-- Row 5: Statusword indicators + DS402 Controlword buttons (of the selected slave), side by side -->
+        <Grid Grid.Row="5" Margin="0,0,0,10">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>
 
-            <GroupBox Grid.Column="0" Header="Statusword (0x6041)" Margin="0,0,6,0">
+            <GroupBox Grid.Column="0" Header="Statusword (0x6041) -- selected slave" Margin="0,0,6,0">
                 <UniformGrid Columns="2" Margin="6">
                     <CheckBox Content="Ready to switch on" IsChecked="{Binding ReadyToSwitchOn, Mode=OneWay}" IsHitTestVisible="False" Focusable="False" Margin="2" />
                     <CheckBox Content="Switched on" IsChecked="{Binding SwitchedOn, Mode=OneWay}" IsHitTestVisible="False" Focusable="False" Margin="2" />
@@ -79,7 +90,7 @@
                 </UniformGrid>
             </GroupBox>
 
-            <GroupBox Grid.Column="1" Header="Controlword (0x6040) -- DS402 transitions" Margin="6,0,0,0">
+            <GroupBox Grid.Column="1" Header="Controlword (0x6040) -- DS402 transitions (selected slave)" Margin="6,0,0,0">
                 <StackPanel Margin="6">
                     <Button Content="Shutdown" Margin="2" Padding="6,4" Command="{Binding ShutdownCommand}" />
                     <Button Content="Switch On" Margin="2" Padding="6,4" Command="{Binding SwitchOnCommand}" />
@@ -90,8 +101,8 @@
             </GroupBox>
         </Grid>
 
-        <!-- Row 5: scrolling log -->
-        <GroupBox Grid.Row="5" Header="Log">
+        <!-- Row 6: scrolling log -->
+        <GroupBox Grid.Row="6" Header="Log">
             <ListBox x:Name="LogListBox" ItemsSource="{Binding LogEntries}" FontFamily="Consolas" FontSize="12">
                 <ListBox.ItemTemplate>
                     <DataTemplate>
