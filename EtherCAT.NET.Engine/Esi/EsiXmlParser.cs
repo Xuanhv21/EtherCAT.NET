@@ -58,6 +58,19 @@ public static class EsiXmlParser
     }
 
     /// <summary>
+    /// Loads and parses an ESI XML file from disk at <paramref name="path"/>. The file is opened
+    /// read-only and streamed straight into <see cref="Parse(Stream)"/> (never pre-decoded to a
+    /// <see cref="string"/>) so the XML reader can honor the file's own encoding declaration, just
+    /// like <see cref="ParseEmbeddedResource"/> does for embedded resources.
+    /// </summary>
+    /// <param name="path">Path of the ESI XML file on disk.</param>
+    public static EsiDeviceLibrary ParseFile(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        return Parse(stream);
+    }
+
+    /// <summary>
     /// Parses an ESI XML document from a stream. The stream is read as-is (not pre-decoded) so
     /// the XML reader can honor the document's own encoding declaration.
     /// </summary>

@@ -2,6 +2,7 @@ using EtherCAT.NET.Engine.Discovery;
 using EtherCAT.NET.Engine.Esc;
 using EtherCAT.NET.Engine.Esi;
 using EtherCAT.NET.Engine.Protocol;
+using EtherCAT.NET.Engine.Tests.Esi;
 using EtherCAT.NET.Engine.Tests.Fakes;
 
 namespace EtherCAT.NET.Engine.Tests.Discovery;
@@ -111,6 +112,50 @@ public class SlaveDiscoveryTests
         var esiLibrary = EsiXmlParser.ParseEmbeddedPanasonicMinasA6Be();
 
         var ex = Assert.Throws<SlaveIdentityMismatchException>(() => SlaveDiscovery.DiscoverSingleSlave(client, esiLibrary));
+        Assert.False(string.IsNullOrWhiteSpace(ex.Message));
+    }
+
+    // --- DiscoverSingleSlave(escClient, IEnumerable<EsiDeviceLibrary>, ...): multi-vendor catalog overload. ---
+
+    private const uint SyntheticVendorId = EsiCatalogTests.SyntheticVendorId;
+    private const uint SyntheticProductCode = EsiCatalogTests.SyntheticProductCode;
+    private const uint SyntheticRevisionNumber = EsiCatalogTests.SyntheticRevisionNumber;
+
+    private static List<EsiDeviceLibrary> CombinedLibraries() =>
+        [EsiXmlParser.ParseEmbeddedPanasonicMinasA6Be(), EsiXmlParser.Parse(EsiCatalogTests.SyntheticEsiXml)];
+
+    [Fact]
+    public void DiscoverSingleSlave_with_a_library_set_matches_the_Panasonic_slave_out_of_a_combined_catalog()
+    {
+        var bus = new FakeBus();
+        bus.AddSlave(new FakeSlaveDevice(PanasonicVendorId, Madln01BeProductCode, Madln01BeRevision));
+        var client = CreateClient(bus);
+
+        var result = SlaveDiscovery.DiscoverSingleSlave(client, CombinedLibraries());
+
+        Assert.Equal("MADLN01BE", result.Device.Name);
+    }
+
+    [Fact]
+    public void DiscoverSingleSlave_with_a_library_set_matches_the_synthetic_slave_out_of_the_same_combined_catalog()
+    {
+        var bus = new FakeBus();
+        bus.AddSlave(new FakeSlaveDevice(SyntheticVendorId, SyntheticProductCode, SyntheticRevisionNumber));
+        var client = CreateClient(bus);
+
+        var result = SlaveDiscovery.DiscoverSingleSlave(client, CombinedLibraries());
+
+        Assert.Equal(EsiCatalogTests.SyntheticDeviceName, result.Device.Name);
+    }
+
+    [Fact]
+    public void DiscoverSingleSlave_with_a_library_set_throws_when_the_connected_slave_matches_neither_library()
+    {
+        var bus = new FakeBus();
+        bus.AddSlave(new FakeSlaveDevice(vendorId: 0x0000AAAA, productCode: 0x0000BBBB, revisionNumber: 0x0000CCCC));
+        var client = CreateClient(bus);
+
+        var ex = Assert.Throws<SlaveIdentityMismatchException>(() => SlaveDiscovery.DiscoverSingleSlave(client, CombinedLibraries()));
         Assert.False(string.IsNullOrWhiteSpace(ex.Message));
     }
 }

@@ -13,11 +13,26 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
-        <!-- Row 0: adapter picker + Start/Stop -->
-        <DockPanel Grid.Row="0" Margin="0,0,0,8" LastChildFill="False">
+        <!-- Row 0: ESI folder (any vendor's *.xml ESI files, scanned by EsiCatalog.LoadFolder) -->
+        <StackPanel Grid.Row="0" Margin="0,0,0,8">
+            <DockPanel LastChildFill="True">
+                <TextBlock Text="ESI Folder:" VerticalAlignment="Center" Margin="0,0,6,0" DockPanel.Dock="Left" />
+                <Button DockPanel.Dock="Right" Content="Rescan" Margin="6,0,0,0" Padding="10,3"
+                        Command="{Binding RescanEsiFolderCommand}" />
+                <Button DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0" Padding="10,3"
+                        Command="{Binding BrowseEsiFolderCommand}" />
+                <TextBox Text="{Binding EsiFolderPath, Mode=OneWay}" IsReadOnly="True" Background="WhiteSmoke"
+                         Padding="4,2" VerticalAlignment="Center" VerticalContentAlignment="Center" />
+            </DockPanel>
+            <TextBlock Text="{Binding EsiCatalogSummary}" Margin="0,4,0,0" TextWrapping="Wrap" Foreground="Gray" />
+        </StackPanel>
+
+        <!-- Row 1: adapter picker + Start/Stop -->
+        <DockPanel Grid.Row="1" Margin="0,0,0,8" LastChildFill="False">
             <TextBlock Text="Adapter:" VerticalAlignment="Center" Margin="0,0,6,0" DockPanel.Dock="Left" />
             <ComboBox DockPanel.Dock="Left" Width="420" VerticalAlignment="Center"
                       ItemsSource="{Binding Adapters}"
@@ -32,20 +47,20 @@
                     Command="{Binding StartCommand}" />
         </DockPanel>
 
-        <!-- Row 1: adapter enumeration error (e.g. Npcap not installed) -->
-        <TextBlock Grid.Row="1" Margin="0,0,0,8" Foreground="Red" TextWrapping="Wrap"
+        <!-- Row 2: adapter enumeration error (e.g. Npcap not installed) -->
+        <TextBlock Grid.Row="2" Margin="0,0,0,8" Foreground="Red" TextWrapping="Wrap"
                    Text="{Binding AdapterError}" />
 
-        <!-- Row 2: AL state -->
-        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,10">
+        <!-- Row 3: AL state -->
+        <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,10">
             <TextBlock Text="AL State:" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,6,0" />
             <TextBlock Text="{Binding AlStateText}" FontSize="16" VerticalAlignment="Center" Margin="0,0,20,0" />
             <TextBlock Text="Data fresh:" VerticalAlignment="Center" Margin="0,0,6,0" />
             <CheckBox IsChecked="{Binding IsDataFresh, Mode=OneWay}" IsHitTestVisible="False" Focusable="False" VerticalAlignment="Center" />
         </StackPanel>
 
-        <!-- Row 3: Statusword indicators + DS402 Controlword buttons, side by side -->
-        <Grid Grid.Row="3" Margin="0,0,0,10">
+        <!-- Row 4: Statusword indicators + DS402 Controlword buttons, side by side -->
+        <Grid Grid.Row="4" Margin="0,0,0,10">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="*" />
@@ -75,8 +90,8 @@
             </GroupBox>
         </Grid>
 
-        <!-- Row 4: scrolling log -->
-        <GroupBox Grid.Row="4" Header="Log">
+        <!-- Row 5: scrolling log -->
+        <GroupBox Grid.Row="5" Header="Log">
             <ListBox x:Name="LogListBox" ItemsSource="{Binding LogEntries}" FontFamily="Consolas" FontSize="12">
                 <ListBox.ItemTemplate>
                     <DataTemplate>

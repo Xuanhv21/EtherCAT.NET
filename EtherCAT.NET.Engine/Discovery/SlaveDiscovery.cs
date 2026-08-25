@@ -70,6 +70,32 @@ public static class SlaveDiscovery
 
         return new DiscoveryResult(slaveCount, stationAddress, identity, device);
     }
+
+    /// <summary>
+    /// Runs the same single-slave discovery sequence as
+    /// <see cref="DiscoverSingleSlave(EscClient, EsiDeviceLibrary, ushort)"/>, but matches the
+    /// discovered identity against a whole set of ESI libraries at once (e.g.
+    /// <see cref="Esi.EsiCatalog.Libraries"/> loaded from a folder holding ESI files from several
+    /// vendors) via <see cref="IdentityMatcher.MatchAny"/> instead of a single library's
+    /// <see cref="IdentityMatcher.Match"/> -- so which vendor/device is actually connected no longer
+    /// has to be known ahead of time by the caller.
+    /// </summary>
+    /// <exception cref="EscCommunicationException">No reply was observed to the initial BRD.</exception>
+    /// <exception cref="EscWorkingCounterException">No slave sits at auto-increment position 0, or a later register access failed.</exception>
+    /// <exception cref="SlaveIdentityMismatchException">The discovered identity matches no device in any of <paramref name="esiLibraries"/>, or more than one.</exception>
+    public static DiscoveryResult DiscoverSingleSlave(EscClient escClient, IEnumerable<EsiDeviceLibrary> esiLibraries, ushort stationAddress = FirstStationAddress)
+    {
+        ArgumentNullException.ThrowIfNull(escClient);
+        ArgumentNullException.ThrowIfNull(esiLibraries);
+
+        var slaveCount = CountSlaves(escClient);
+        AssignStationAddress(escClient, stationAddress);
+
+        var identity = SlaveIdentity.Read(escClient, stationAddress);
+        var device = IdentityMatcher.MatchAny(identity, esiLibraries);
+
+        return new DiscoveryResult(slaveCount, stationAddress, identity, device);
+    }
 }
 
 /// <summary>Outcome of <see cref="SlaveDiscovery.DiscoverSingleSlave"/>.</summary>

@@ -1,4 +1,6 @@
 using System.Collections.ObjectModel;
+using System.IO;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using EtherCAT.NET.Engine.Discovery;
@@ -9,6 +11,7 @@ using EtherCAT.NET.Engine.Protocol;
 using EtherCAT.NET.Engine.StateMachine;
 using EtherCAT.NET.Mvvm;
 using EtherCAT.NET.Transport.Pcap;
+using Microsoft.Win32;
 
 namespace EtherCAT.NET;
 
@@ -16,8 +19,9 @@ namespace EtherCAT.NET;
 /// The Milestone 1 bring-up view model described in the implementation plan's "UI WPF" section.
 /// Owns the whole master pipeline for one adapter/one slave: opens
 /// <see cref="PcapEthernetFrameTransport"/> for the selected <see cref="AdapterInfo"/>, runs
-/// <see cref="SlaveDiscovery.DiscoverSingleSlave"/> against the embedded Panasonic MINAS A6BE ESI
-/// descriptor, computes the process-image plan with <see cref="ProcessImageBuilder"/>, drives
+/// <see cref="SlaveDiscovery"/> against every ESI file currently loaded from <see cref="EsiFolderPath"/>
+/// (any vendor's files side by side -- see <see cref="EsiCatalog"/> and <see cref="RescanEsiFolder"/>),
+/// computes the process-image plan with <see cref="ProcessImageBuilder"/>, drives
 /// <see cref="AlStateMachine"/> INIT-&gt;PREOP-&gt;SAFEOP-&gt;OP (wiring its <c>onSafeOpRequested</c>
 /// hook to start <see cref="CyclicExchangeService"/> at exactly the right instant, per
 /// <see cref="AlStateMachine"/>'s own remarks), and thereafter exposes the cyclic exchange's
@@ -56,11 +60,16 @@ public sealed class MainWindowViewModel : ObservableObject
 
     private const int MaxLogEntries = 2000;
 
+    // Deployment default for a brand-new machine's ESI folder -- an app-layer concern (where to look
+    // on disk), not something EtherCAT.NET.Engine's EsiCatalog itself should know or hard-code.
+    private const string DefaultEsiFolderPath = @"D:\EtherCAT\ESI";
+
     private readonly SynchronizationContext? _uiContext;
     private int _lifecycleState = LifecycleIdle;
 
     private PcapEthernetFrameTransport? _transport;
     private CyclicExchangeService? _cyclicExchange;
+    private EsiCatalog _esiCatalog = new([]);
 
     private AdapterInfo? _selectedAdapter;
     private string? _adapterError;
@@ -78,6 +87,9 @@ public sealed class MainWindowViewModel : ObservableObject
     private bool _warning;
     private bool _isDataFresh;
 
+    private string _esiFolderPath = DefaultEsiFolderPath;
+    private string _esiCatalogSummary = "Not scanned yet.";
+
     /// <summary>Creates the view model. Must be constructed on the UI thread — its constructor captures <see cref="SynchronizationContext.Current"/> for later marshaling.</summary>
     public MainWindowViewModel()
     {
@@ -89,6 +101,8 @@ public sealed class MainWindowViewModel : ObservableObject
         StartCommand = new RelayCommand(() => _ = StartAsync(), () => CanStart);
         StopCommand = new RelayCommand(() => _ = StopAsync(), () => CanStop);
         RefreshAdaptersCommand = new RelayCommand(LoadAdapters, () => !IsBusy && !IsRunning);
+        BrowseEsiFolderCommand = new RelayCommand(BrowseEsiFolder, () => !IsBusy && !IsRunning);
+        RescanEsiFolderCommand = new RelayCommand(RescanEsiFolder, () => !IsBusy && !IsRunning);
 
         ShutdownCommand = new RelayCommand(() => SendControlword("Shutdown", Ds402Controlword.Shutdown), () => IsRunning);
         SwitchOnCommand = new RelayCommand(() => SendControlword("Switch On", Ds402Controlword.SwitchOn), () => IsRunning);
@@ -97,6 +111,11 @@ public sealed class MainWindowViewModel : ObservableObject
         FaultResetCommand = new RelayCommand(() => SendControlword("Fault Reset", Ds402Controlword.FaultReset), () => IsRunning);
 
         LoadAdapters();
+
+        // First-run convenience: a brand-new machine's ESI folder starts out empty, so seed it with
+        // the embedded Panasonic file before the initial scan -- see SeedEsiFolderIfEmpty's remarks.
+        SeedEsiFolderIfEmpty();
+        RescanEsiFolder();
     }
 
     /// <summary>Every adapter <see cref="PcapAdapters.GetAvailableAdapters()"/> reported the last time it was called — never throws, never null, empty when Npcap is missing.</summary>
@@ -194,8 +213,36 @@ public sealed class MainWindowViewModel : ObservableObject
     /// <summary><c>true</c> when the most recent cycle's LRW exchange succeeded (WKC as expected) — the Statusword bits above reflect that cycle; when <c>false</c> they are held over from the last cycle that did succeed.</summary>
     public bool IsDataFresh { get => _isDataFresh; private set => SetField(ref _isDataFresh, value); }
 
+    /// <summary>
+    /// Folder scanned for ESI XML files (any vendor's files side by side — see
+    /// <see cref="EsiCatalog.LoadFolder"/>). Defaults to <see cref="DefaultEsiFolderPath"/>; changed
+    /// only via <see cref="BrowseEsiFolderCommand"/>.
+    /// </summary>
+    public string EsiFolderPath
+    {
+        get => _esiFolderPath;
+        private set => SetField(ref _esiFolderPath, value);
+    }
+
+    /// <summary>
+    /// Short human-readable result of the last <see cref="RescanEsiFolder"/> (e.g. "Loaded 3 device(s)
+    /// from 2 file(s) in 'D:\EtherCAT\ESI'."). Per-file parse failures are not repeated here — each is
+    /// instead appended to <see cref="LogEntries"/> as its own "ESI parse failed: ..." line.
+    /// </summary>
+    public string EsiCatalogSummary
+    {
+        get => _esiCatalogSummary;
+        private set => SetField(ref _esiCatalogSummary, value);
+    }
+
     /// <summary>Re-enumerates <see cref="Adapters"/>. Never throws, per <see cref="PcapAdapters.GetAvailableAdapters(out string?)"/>.</summary>
     public RelayCommand RefreshAdaptersCommand { get; }
+
+    /// <summary>Opens a Win32 folder picker for <see cref="EsiFolderPath"/> and, if the user confirms a folder, rescans it.</summary>
+    public RelayCommand BrowseEsiFolderCommand { get; }
+
+    /// <summary>Re-runs <see cref="RescanEsiFolder"/> against the current <see cref="EsiFolderPath"/>.</summary>
+    public RelayCommand RescanEsiFolderCommand { get; }
 
     /// <summary>Opens the selected adapter and runs the full discovery -&gt; PREOP -&gt; SAFEOP -&gt; OP bring-up.</summary>
     public RelayCommand StartCommand { get; }
@@ -218,7 +265,7 @@ public sealed class MainWindowViewModel : ObservableObject
     /// <summary>Sends Controlword = <see cref="Ds402Controlword.FaultReset"/> (0x0080).</summary>
     public RelayCommand FaultResetCommand { get; }
 
-    private bool CanStart => !IsBusy && !IsRunning && SelectedAdapter is not null;
+    private bool CanStart => !IsBusy && !IsRunning && SelectedAdapter is not null && _esiCatalog.Libraries.Count > 0;
 
     private bool CanStop => !IsBusy && IsRunning;
 
@@ -248,6 +295,121 @@ public sealed class MainWindowViewModel : ObservableObject
             Adapters.Clear();
             AdapterError = $"Could not list network adapters ({ex.GetType().Name}: {ex.Message}).";
             SelectedAdapter = null;
+        }
+    }
+
+    /// <summary>
+    /// Ensures a brand-new machine's <see cref="EsiFolderPath"/> is not left empty by seeding it with
+    /// the embedded Panasonic MINAS A6BE ESI file the very first time, via
+    /// <see cref="EsiCatalog.SeedIfEmpty"/>. The embedded resource is located exactly the way
+    /// <see cref="EsiXmlParser.ParseEmbeddedPanasonicMinasA6Be"/> locates it -- by
+    /// <see cref="Assembly.GetManifestResourceNames"/> matching
+    /// <see cref="EsiXmlParser.PanasonicMinasA6BeResourceFileName"/> -- because
+    /// <see cref="EsiCatalog.SeedIfEmpty"/> needs the raw resource <see cref="Stream"/>, not an
+    /// already-parsed library. A no-op once the folder already holds any <c>*.xml</c> file (see
+    /// <see cref="EsiCatalog.SeedIfEmpty"/>'s own remarks). Never throws -- any failure (e.g. the
+    /// folder is unwritable) is logged via <see cref="AppendLog"/> instead, the same defensive spirit
+    /// as <see cref="LoadAdapters"/>.
+    /// </summary>
+    private void SeedEsiFolderIfEmpty()
+    {
+        try
+        {
+            var assembly = typeof(EsiXmlParser).Assembly;
+            var resourceName = assembly.GetManifestResourceNames()
+                .FirstOrDefault(n => n.EndsWith(EsiXmlParser.PanasonicMinasA6BeResourceFileName, StringComparison.Ordinal));
+
+            if (resourceName is null)
+            {
+                AppendLog($"Could not seed ESI folder: no embedded resource ending in '{EsiXmlParser.PanasonicMinasA6BeResourceFileName}' was found.");
+                return;
+            }
+
+            using var stream = assembly.GetManifestResourceStream(resourceName);
+            if (stream is null)
+            {
+                AppendLog($"Could not seed ESI folder: embedded resource '{resourceName}' could not be opened.");
+                return;
+            }
+
+            EsiCatalog.SeedIfEmpty(EsiFolderPath, EsiXmlParser.PanasonicMinasA6BeResourceFileName, stream);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Could not seed ESI folder '{EsiFolderPath}': {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Opens a Win32 folder picker (<see cref="OpenFolderDialog"/>) pre-set to the current
+    /// <see cref="EsiFolderPath"/> and, if the user confirms a folder, switches <see cref="EsiFolderPath"/>
+    /// to it and re-runs <see cref="RescanEsiFolder"/>. Only invoked via <see cref="BrowseEsiFolderCommand"/>,
+    /// which is gated the same as <see cref="RefreshAdaptersCommand"/> so the folder cannot change out
+    /// from under a live bring-up.
+    /// </summary>
+    private void BrowseEsiFolder()
+    {
+        var dialog = new OpenFolderDialog
+        {
+            Title = "Select ESI Folder",
+        };
+
+        if (Directory.Exists(EsiFolderPath))
+        {
+            dialog.InitialDirectory = EsiFolderPath;
+            dialog.FolderName = EsiFolderPath;
+        }
+
+        if (dialog.ShowDialog() != true)
+        {
+            return;
+        }
+
+        EsiFolderPath = dialog.FolderName;
+        RescanEsiFolder();
+    }
+
+    /// <summary>
+    /// Re-loads <see cref="EsiFolderPath"/> via <see cref="EsiCatalog.LoadFolder"/> and stores the
+    /// result in <see cref="_esiCatalog"/> for <see cref="RunBringUp"/> to discover against. Updates
+    /// <see cref="EsiCatalogSummary"/> with a short "Loaded N device(s) from M file(s)..." line and,
+    /// per failed file, appends one "ESI parse failed: ..." line to <see cref="LogEntries"/> via
+    /// <see cref="AppendLog"/> -- the same "surface loudly, never silently swallow" spirit already used
+    /// elsewhere in this class. Never throws: a folder that does not exist yet, cannot be read, or any
+    /// other failure from <see cref="EsiCatalog.LoadFolder"/> itself is logged instead, leaving
+    /// whatever catalog was previously loaded (if any) in place rather than losing it to a failed
+    /// rescan.
+    /// </summary>
+    private void RescanEsiFolder()
+    {
+        try
+        {
+            var catalog = EsiCatalog.LoadFolder(EsiFolderPath);
+            _esiCatalog = catalog;
+
+            var deviceCount = catalog.Libraries.Sum(l => l.Devices.Count);
+            var failures = catalog.Entries.Where(e => e.Error is not null).ToList();
+
+            var summary = $"Loaded {deviceCount} device(s) from {catalog.Libraries.Count} file(s) in '{EsiFolderPath}'.";
+            if (failures.Count > 0)
+            {
+                summary += $" ({failures.Count} file(s) failed to parse -- see log.)";
+            }
+
+            EsiCatalogSummary = summary;
+
+            foreach (var failure in failures)
+            {
+                AppendLog($"ESI parse failed: {Path.GetFileName(failure.FilePath)} - {failure.Error}");
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Could not scan ESI folder '{EsiFolderPath}': {ex.Message}");
+        }
+        finally
+        {
+            RaiseCanExecuteChangedAll();
         }
     }
 
@@ -351,10 +513,17 @@ public sealed class MainWindowViewModel : ObservableObject
         try
         {
             var escClient = new EscClient(transport, SourceMac);
-            var esiLibrary = EsiXmlParser.ParseEmbeddedPanasonicMinasA6Be();
+            var catalog = _esiCatalog;
+
+            if (catalog.Libraries.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    $"No usable ESI files are loaded from '{EsiFolderPath}'. Add at least one valid " +
+                    "ESI XML file to that folder, click Rescan, then Start again.");
+            }
 
             AppendLog("Discovering slave(s) on the bus...");
-            var discovery = SlaveDiscovery.DiscoverSingleSlave(escClient, esiLibrary);
+            var discovery = SlaveDiscovery.DiscoverSingleSlave(escClient, catalog.Libraries);
             AppendLog($"Discovered {discovery.SlaveCount} slave(s); matched '{discovery.Device.Name}' " +
                       $"(ProductCode=0x{discovery.Device.ProductCode:X8}, Revision=0x{discovery.Device.RevisionNumber:X8}), " +
                       $"assigned Configured Station Address 0x{discovery.StationAddress:X4}.");
@@ -475,6 +644,8 @@ public sealed class MainWindowViewModel : ObservableObject
         StartCommand.RaiseCanExecuteChanged();
         StopCommand.RaiseCanExecuteChanged();
         RefreshAdaptersCommand.RaiseCanExecuteChanged();
+        BrowseEsiFolderCommand.RaiseCanExecuteChanged();
+        RescanEsiFolderCommand.RaiseCanExecuteChanged();
         ShutdownCommand.RaiseCanExecuteChanged();
         SwitchOnCommand.RaiseCanExecuteChanged();
         EnableOperationCommand.RaiseCanExecuteChanged();
