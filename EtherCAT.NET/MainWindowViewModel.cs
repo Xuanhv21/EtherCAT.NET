@@ -3,6 +3,7 @@ using System.IO;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows.Threading;
 using EtherCAT.NET.Engine.Discovery;
 using EtherCAT.NET.Engine.Esc;
 using EtherCAT.NET.Engine.Esi;
@@ -95,6 +96,15 @@ public sealed class MainWindowViewModel : ObservableObject
     private string _esiFolderPath = DefaultEsiFolderPath;
     private string _esiCatalogSummary = "Not scanned yet.";
 
+    private double _jogVelocity = 50.0;
+    private double _jogAcceleration = 200.0;
+    private double _jogDeceleration = 400.0;
+    private int _jogSlaveIndex = -1;
+    private DispatcherTimer? _jogHeartbeatTimer;
+
+    private volatile MultiSlaveProcessImageSnapshot? _lastSnapshot;
+    private bool _isServoSequenceRunning;
+
     /// <summary>Creates the view model. Must be constructed on the UI thread — its constructor captures <see cref="SynchronizationContext.Current"/> for later marshaling.</summary>
     public MainWindowViewModel()
     {
@@ -109,6 +119,9 @@ public sealed class MainWindowViewModel : ObservableObject
         RefreshAdaptersCommand = new RelayCommand(LoadAdapters, () => !IsBusy && !IsRunning);
         BrowseEsiFolderCommand = new RelayCommand(BrowseEsiFolder, () => !IsBusy && !IsRunning);
         RescanEsiFolderCommand = new RelayCommand(RescanEsiFolder, () => !IsBusy && !IsRunning);
+
+        ServoOnCommand = new RelayCommand(() => _ = ServoOnAsync(), () => CanServoOn);
+        ServoOffCommand = new RelayCommand(() => SendControlword("Servo OFF", Ds402Controlword.DisableVoltage), () => CanSendControlword);
 
         ShutdownCommand = new RelayCommand(() => SendControlword("Shutdown", Ds402Controlword.Shutdown), () => CanSendControlword);
         SwitchOnCommand = new RelayCommand(() => SendControlword("Switch On", Ds402Controlword.SwitchOn), () => CanSendControlword);
@@ -175,6 +188,7 @@ public sealed class MainWindowViewModel : ObservableObject
             if (SetField(ref _selectedSlave, value))
             {
                 RaiseCanExecuteChangedAll();
+                OnPropertyChanged(nameof(CanJog));
             }
         }
     }
@@ -203,6 +217,7 @@ public sealed class MainWindowViewModel : ObservableObject
             {
                 RaiseCanExecuteChangedAll();
                 OnPropertyChanged(nameof(CanEditAdapterSelection));
+                OnPropertyChanged(nameof(CanJog));
             }
         }
     }
@@ -245,6 +260,69 @@ public sealed class MainWindowViewModel : ObservableObject
     public bool IsDataFresh { get => _isDataFresh; private set => SetField(ref _isDataFresh, value); }
 
     /// <summary>
+    /// The jog speed the selected slave ramps toward while a jog button is held, in raw position
+    /// units/sec — see <see cref="MultiSlaveCyclicExchangeService.JogVelocity"/>. No unit scaling
+    /// exists anywhere in this milestone (raw encoder counts, not mm/degrees/RPM): start small and
+    /// increase gradually while watching the real motor. Pushed to the live engine immediately if a
+    /// bring-up is already running.
+    /// </summary>
+    public double JogVelocity
+    {
+        get => _jogVelocity;
+        set
+        {
+            if (SetField(ref _jogVelocity, value) && _cyclicExchange is not null)
+            {
+                _cyclicExchange.JogVelocity = value;
+            }
+        }
+    }
+
+    /// <summary>How quickly jog speed ramps UP toward <see cref="JogVelocity"/> (raw units/sec²) — see <see cref="MultiSlaveCyclicExchangeService.JogAcceleration"/>. Pushed to the live engine immediately if a bring-up is already running.</summary>
+    public double JogAcceleration
+    {
+        get => _jogAcceleration;
+        set
+        {
+            if (SetField(ref _jogAcceleration, value) && _cyclicExchange is not null)
+            {
+                _cyclicExchange.JogAcceleration = value;
+            }
+        }
+    }
+
+    /// <summary>How quickly jog speed ramps DOWN to 0 on release (raw units/sec²) — see <see cref="MultiSlaveCyclicExchangeService.JogDeceleration"/>. Pushed to the live engine immediately if a bring-up is already running.</summary>
+    public double JogDeceleration
+    {
+        get => _jogDeceleration;
+        set
+        {
+            if (SetField(ref _jogDeceleration, value) && _cyclicExchange is not null)
+            {
+                _cyclicExchange.JogDeceleration = value;
+            }
+        }
+    }
+
+    /// <summary><c>true</c> when the two Jog buttons (and the velocity/acceleration/deceleration boxes) should be enabled — running, with a slave actually selected. Shares the exact same gate as the five DS402 Controlword buttons.</summary>
+    public bool CanJog => CanSendControlword;
+
+    /// <summary><c>true</c> while <see cref="ServoOnAsync"/> is actively walking the DS402 sequence for some slave (disables re-entrant Servo ON clicks; the raw DS402 buttons and Servo OFF remain available regardless).</summary>
+    public bool IsServoSequenceRunning
+    {
+        get => _isServoSequenceRunning;
+        private set
+        {
+            if (SetField(ref _isServoSequenceRunning, value))
+            {
+                RaiseCanExecuteChangedAll();
+            }
+        }
+    }
+
+    private bool CanServoOn => CanSendControlword && !IsServoSequenceRunning;
+
+    /// <summary>
     /// Folder scanned for ESI XML files (any vendor's files side by side — see
     /// <see cref="EsiCatalog.LoadFolder"/>). Defaults to <see cref="DefaultEsiFolderPath"/>; changed
     /// only via <see cref="BrowseEsiFolderCommand"/>.
@@ -280,6 +358,12 @@ public sealed class MainWindowViewModel : ObservableObject
 
     /// <summary>Stops the cyclic exchange (sending one final Disable Voltage cycle first, per <see cref="CyclicExchangeService.Stop"/>) and closes the transport.</summary>
     public RelayCommand StopCommand { get; }
+
+    /// <summary>Walks the standard DS402 Shutdown -&gt; Switch On -&gt; Enable Operation sequence for the selected slave, waiting for each step's Statusword confirmation before sending the next — see <see cref="ServoOnAsync"/>.</summary>
+    public RelayCommand ServoOnCommand { get; }
+
+    /// <summary>Sends Controlword = <see cref="Ds402Controlword.DisableVoltage"/> (0x0000) to the selected slave — immediate, no waiting (the drive's power stage drops out right away).</summary>
+    public RelayCommand ServoOffCommand { get; }
 
     /// <summary>Sends Controlword = <see cref="Ds402Controlword.Shutdown"/> (0x0006).</summary>
     public RelayCommand ShutdownCommand { get; }
@@ -493,6 +577,8 @@ public sealed class MainWindowViewModel : ObservableObject
             return;
         }
 
+        EndJog(); // defensive: a jog button held through Stop must not keep renewing after the service is gone.
+
         IsBusy = true;
         AppendLog("Stopping...");
 
@@ -599,7 +685,12 @@ public sealed class MainWindowViewModel : ObservableObject
             var plan = ProcessImageBuilder.BuildMulti(discoveries.Select(d => (d.StationAddress, d.Device)).ToList());
 
             var stateMachine = new MultiSlaveAlStateMachine(escClient, transport, SourceMac, stationAddresses);
-            cyclic = new MultiSlaveCyclicExchangeService(transport, SourceMac, plan);
+            cyclic = new MultiSlaveCyclicExchangeService(transport, SourceMac, plan)
+            {
+                JogVelocity = JogVelocity,
+                JogAcceleration = JogAcceleration,
+                JogDeceleration = JogDeceleration,
+            };
             cyclic.StatusUpdated += OnStatusUpdated;
             cyclic.LogEmitted += AppendLog;
 
@@ -659,6 +750,12 @@ public sealed class MainWindowViewModel : ObservableObject
     /// </summary>
     private void OnStatusUpdated(MultiSlaveProcessImageSnapshot snapshot)
     {
+        // Cached immediately, on the cyclic thread, independent of which slave the UI happens to
+        // have selected right now -- ServoOnAsync polls this (for whichever slave IT is sequencing)
+        // rather than depending on the UI-bound Statusword properties below, which only ever reflect
+        // SelectedSlave.
+        _lastSnapshot = snapshot;
+
         RunOnUiThread(() =>
         {
             AlStateText = snapshot.IsFaulted ? $"{snapshot.AlState} (FAULTED)" : snapshot.AlState.ToString();
@@ -693,6 +790,140 @@ public sealed class MainWindowViewModel : ObservableObject
 
         _cyclicExchange?.SetControlword(slave.Index, value);
         AppendLog($"Slave {slave.Index} (station 0x{slave.StationAddress:X4}): Controlword -> {name} (0x{value:X4}).");
+    }
+
+    /// <summary>
+    /// Convenience "Servo ON" sequence for whichever slave is currently <see cref="SelectedSlave"/>:
+    /// walks the standard DS402 power-state sequence — Shutdown, then Switch On, then Enable
+    /// Operation — waiting after each command for that slave's own Statusword (via
+    /// <see cref="RunServoOnStepAsync"/>, polling <see cref="_lastSnapshot"/>) to actually confirm
+    /// the corresponding state before sending the next one, rather than firing all three blindly.
+    /// Which slave is sequenced is fixed to whatever was selected when this started, exactly like
+    /// <see cref="BeginJog"/>. Logs every step; if any step times out, logs the failure and stops
+    /// without attempting the remaining steps. The five raw DS402 buttons stay available for manual,
+    /// step-by-step control — this is purely a convenience wrapper around the exact same
+    /// <see cref="MultiSlaveCyclicExchangeService.SetControlword"/> call they use, not a new command
+    /// path. Guarded by <see cref="IsServoSequenceRunning"/> against re-entrant clicks.
+    /// </summary>
+    private async Task ServoOnAsync()
+    {
+        var slave = SelectedSlave;
+        if (slave is null || _cyclicExchange is null || !IsRunning || IsServoSequenceRunning)
+        {
+            return;
+        }
+
+        IsServoSequenceRunning = true;
+        var index = slave.Index;
+
+        try
+        {
+            AppendLog($"Slave {index} (station 0x{slave.StationAddress:X4}): Servo ON sequence starting...");
+
+            if (!await RunServoOnStepAsync(index, Ds402Controlword.Shutdown, "Shutdown", s => s.ReadyToSwitchOn, "Ready to switch on").ConfigureAwait(true))
+            {
+                return;
+            }
+
+            if (!await RunServoOnStepAsync(index, Ds402Controlword.SwitchOn, "Switch On", s => s.SwitchedOn, "Switched on").ConfigureAwait(true))
+            {
+                return;
+            }
+
+            if (!await RunServoOnStepAsync(index, Ds402Controlword.EnableOperation, "Enable Operation", s => s.OperationEnabled, "Operation enabled").ConfigureAwait(true))
+            {
+                return;
+            }
+
+            AppendLog($"Slave {index}: Servo ON complete (Operation enabled).");
+        }
+        finally
+        {
+            IsServoSequenceRunning = false;
+        }
+    }
+
+    /// <summary>
+    /// Sends <paramref name="controlword"/> to slave <paramref name="slaveIndex"/>, then polls
+    /// <see cref="_lastSnapshot"/> (updated every cycle by <see cref="OnStatusUpdated"/>, independent
+    /// of <see cref="SelectedSlave"/>) roughly every 20 ms until <paramref name="reached"/> is true
+    /// for that slave's Statusword, or <paramref name="timeout"/> (default 3 seconds) elapses.
+    /// </summary>
+    /// <returns><c>true</c> if <paramref name="reached"/> became true in time; <c>false</c> (after logging why) on timeout.</returns>
+    private async Task<bool> RunServoOnStepAsync(int slaveIndex, ushort controlword, string commandName, Func<Ds402Statusword, bool> reached, string stateName, TimeSpan? timeout = null)
+    {
+        _cyclicExchange?.SetControlword(slaveIndex, controlword);
+        AppendLog($"Slave {slaveIndex}: Controlword -> {commandName} (0x{controlword:X4}); waiting for '{stateName}'...");
+
+        var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(3));
+        while (DateTime.UtcNow < deadline)
+        {
+            var snapshot = _lastSnapshot;
+            if (snapshot is not null && slaveIndex < snapshot.Slaves.Count && reached(snapshot.Slaves[slaveIndex].Status))
+            {
+                return true;
+            }
+
+            await Task.Delay(20).ConfigureAwait(true);
+        }
+
+        AppendLog($"Slave {slaveIndex}: Servo ON failed — timed out waiting for '{stateName}' after {commandName}.");
+        return false;
+    }
+
+    /// <summary>
+    /// Starts jogging the currently <see cref="SelectedSlave"/> in <paramref name="direction"/> (-1
+    /// or +1): sends one immediate <see cref="MultiSlaveCyclicExchangeService.SetJog"/> call, then
+    /// starts a UI-thread <see cref="DispatcherTimer"/> that renews it well inside the engine's own
+    /// <see cref="MultiSlaveCyclicExchangeService.JogHeartbeatTimeout"/> for as long as the caller
+    /// keeps jogging held (i.e. until <see cref="EndJog"/> is called). Called from
+    /// <c>MainWindow.xaml.cs</c>'s jog-button mouse-down handler; a no-op if nothing is running or no
+    /// slave is selected (mirrors <see cref="CanJog"/>, which already gates the buttons themselves).
+    /// Which slave is jogged is fixed to whatever was selected at the moment this is called — it is
+    /// not re-read from <see cref="SelectedSlave"/> again until the next <see cref="BeginJog"/>.
+    /// </summary>
+    public void BeginJog(int direction)
+    {
+        var slave = SelectedSlave;
+        var cyclic = _cyclicExchange;
+        if (slave is null || cyclic is null || !IsRunning)
+        {
+            return;
+        }
+
+        EndJog(); // stop any previous jog (e.g. a stray double-press) before starting a new one.
+
+        _jogSlaveIndex = slave.Index;
+        cyclic.SetJog(_jogSlaveIndex, direction);
+        AppendLog($"Slave {_jogSlaveIndex} (station 0x{slave.StationAddress:X4}): jog {(direction > 0 ? "+" : "-")} started " +
+                  $"(target {JogVelocity:F0} units/sec, accel {JogAcceleration:F0}, decel {JogDeceleration:F0}).");
+
+        _jogHeartbeatTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(80) };
+        _jogHeartbeatTimer.Tick += (_, _) => cyclic.SetJog(_jogSlaveIndex, direction);
+        _jogHeartbeatTimer.Start();
+    }
+
+    /// <summary>
+    /// Stops whatever jog <see cref="BeginJog"/> last started (a no-op if none is active): stops the
+    /// heartbeat-renewal timer and sends one final <see cref="MultiSlaveCyclicExchangeService.SetJog"/>
+    /// with direction 0. Called from the jog buttons' mouse-up/lost-capture handlers — and, defensively,
+    /// from <see cref="StopAsync"/> in case a jog button is somehow still held through Stop.
+    /// </summary>
+    public void EndJog()
+    {
+        _jogHeartbeatTimer?.Stop();
+        _jogHeartbeatTimer = null;
+
+        if (_jogSlaveIndex < 0)
+        {
+            return;
+        }
+
+        var slaveIndex = _jogSlaveIndex;
+        _jogSlaveIndex = -1;
+
+        _cyclicExchange?.SetJog(slaveIndex, 0);
+        AppendLog($"Slave {slaveIndex}: jog stopped.");
     }
 
     /// <summary>
@@ -731,6 +962,8 @@ public sealed class MainWindowViewModel : ObservableObject
         RefreshAdaptersCommand.RaiseCanExecuteChanged();
         BrowseEsiFolderCommand.RaiseCanExecuteChanged();
         RescanEsiFolderCommand.RaiseCanExecuteChanged();
+        ServoOnCommand.RaiseCanExecuteChanged();
+        ServoOffCommand.RaiseCanExecuteChanged();
         ShutdownCommand.RaiseCanExecuteChanged();
         SwitchOnCommand.RaiseCanExecuteChanged();
         EnableOperationCommand.RaiseCanExecuteChanged();

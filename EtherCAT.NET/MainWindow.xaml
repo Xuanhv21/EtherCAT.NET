@@ -7,8 +7,12 @@
         mc:Ignorable="d"
         Title="EtherCAT.NET -- Milestone 1 Bring-Up" Height="620" Width="920"
         MinHeight="480" MinWidth="720">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+    </Window.Resources>
     <Grid Margin="10">
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
@@ -90,8 +94,24 @@
                 </UniformGrid>
             </GroupBox>
 
-            <GroupBox Grid.Column="1" Header="Controlword (0x6040) -- DS402 transitions (selected slave)" Margin="6,0,0,0">
+            <GroupBox Grid.Column="1" Header="Controlword (0x6040) -- selected slave" Margin="6,0,0,0">
                 <StackPanel Margin="6">
+                    <!-- Servo ON/OFF: convenience wrapper around the full DS402 sequence; see
+                         MainWindowViewModel.ServoOnAsync. Servo OFF is just Disable Voltage,
+                         immediate. -->
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <Button Content="Servo ON" Padding="20,8" Margin="0,0,6,0" FontWeight="Bold"
+                                Background="#FF2E7D32" Foreground="White"
+                                Command="{Binding ServoOnCommand}" />
+                        <Button Content="Servo OFF" Padding="20,8" FontWeight="Bold"
+                                Background="#FFC62828" Foreground="White"
+                                Command="{Binding ServoOffCommand}" />
+                    </StackPanel>
+                    <TextBlock Text="Servo ON sequence in progress..." Foreground="DarkOrange" Margin="0,0,0,6"
+                               Visibility="{Binding IsServoSequenceRunning, Converter={StaticResource BoolToVisibility}}" />
+
+                    <Separator Margin="0,0,0,8" />
+                    <TextBlock Text="Advanced (raw DS402 transitions):" Foreground="Gray" Margin="0,0,0,4" />
                     <Button Content="Shutdown" Margin="2" Padding="6,4" Command="{Binding ShutdownCommand}" />
                     <Button Content="Switch On" Margin="2" Padding="6,4" Command="{Binding SwitchOnCommand}" />
                     <Button Content="Enable Operation" Margin="2" Padding="6,4" Command="{Binding EnableOperationCommand}" />
@@ -101,8 +121,41 @@
             </GroupBox>
         </Grid>
 
-        <!-- Row 6: scrolling log -->
-        <GroupBox Grid.Row="6" Header="Log">
+        <!-- Row 6: jog (Cyclic Synchronous Position) for the selected slave. Hold to move, release
+             to stop; see MainWindow.xaml.cs's Jog*_PreviewMouseLeftButton*/LostMouseCapture
+             handlers and MainWindowViewModel.BeginJog/EndJog. -->
+        <GroupBox Grid.Row="6" Header="Jog (CSP, position mode) -- selected slave" Margin="0,0,0,10">
+            <StackPanel Margin="6">
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                    <TextBlock Text="Velocity (units/sec):" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <TextBox Width="70" Text="{Binding JogVelocity, UpdateSourceTrigger=PropertyChanged}"
+                             IsEnabled="{Binding CanJog}" VerticalContentAlignment="Center" Margin="0,0,16,0" />
+                    <TextBlock Text="Acceleration (units/sec&#178;):" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <TextBox Width="70" Text="{Binding JogAcceleration, UpdateSourceTrigger=PropertyChanged}"
+                             IsEnabled="{Binding CanJog}" VerticalContentAlignment="Center" Margin="0,0,16,0" />
+                    <TextBlock Text="Deceleration (units/sec&#178;):" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <TextBox Width="70" Text="{Binding JogDeceleration, UpdateSourceTrigger=PropertyChanged}"
+                             IsEnabled="{Binding CanJog}" VerticalContentAlignment="Center" />
+                </StackPanel>
+                <StackPanel Orientation="Horizontal">
+                    <Button x:Name="JogNegativeButton" Content="&#9664; Jog" Padding="18,6" Margin="0,0,6,0"
+                            IsEnabled="{Binding CanJog}" Tag="-1"
+                            PreviewMouseLeftButtonDown="JogButton_PreviewMouseLeftButtonDown"
+                            PreviewMouseLeftButtonUp="JogButton_PreviewMouseLeftButtonUp"
+                            LostMouseCapture="JogButton_LostMouseCapture" />
+                    <Button x:Name="JogPositiveButton" Content="Jog &#9654;" Padding="18,6" Margin="0,0,16,0"
+                            IsEnabled="{Binding CanJog}" Tag="1"
+                            PreviewMouseLeftButtonDown="JogButton_PreviewMouseLeftButtonDown"
+                            PreviewMouseLeftButtonUp="JogButton_PreviewMouseLeftButtonUp"
+                            LostMouseCapture="JogButton_LostMouseCapture" />
+                    <TextBlock VerticalAlignment="Center" Foreground="Gray" TextWrapping="Wrap" MaxWidth="380"
+                               Text="Hold to move, release to decelerate to a stop. No unit scaling in this milestone (raw encoder counts, not mm/RPM) -- start with a small velocity and increase gradually while watching the real motor." />
+                </StackPanel>
+            </StackPanel>
+        </GroupBox>
+
+        <!-- Row 7: scrolling log -->
+        <GroupBox Grid.Row="7" Header="Log">
             <ListBox x:Name="LogListBox" ItemsSource="{Binding LogEntries}" FontFamily="Consolas" FontSize="12">
                 <ListBox.ItemTemplate>
                     <DataTemplate>
